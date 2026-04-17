@@ -25,16 +25,28 @@ struct Jobs {
 }
 
 impl Jobs {
-    fn start<F: FnOnce() -> Output + Send + 'static>(&mut self, f: F) -> JobId {
-        let (tx, rx) = flume::unbounded();
-        let handle = thread::spawn(move || {
+fn start<F: FnOnce() -> Output + Send + 'static>(&mut self, f: F) -> JobId {
+    let (tx, rx) = flume::unbounded();
+    let id = self.next_job.to_string();
+    self.next_job += 1;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        thread::spawn(move || {
             let _ = tx.send(f());
-        });
-        let id = self.next_job.to_string();
-        self.next_job += 1;
-        self.map.insert(id.clone(), Job { rx, handle });
-        id
+        })
+    }));
+
+    match result {
+        Ok(handle) => {
+            self.map.insert(id.clone(), Job { rx, handle });
+        }
+        Err(_) => {
+            eprintln!("rust-g: thread spawn failed (likely EAGAIN)");
+        }
     }
+
+    id
+}
 
     fn check(&mut self, id: &str) -> Output {
         let entry = match self.map.entry(id.to_owned()) {
