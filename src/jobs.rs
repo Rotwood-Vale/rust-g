@@ -25,23 +25,25 @@ struct Jobs {
 }
 
 impl Jobs {
-fn start<F: FnOnce() -> Output + Send + 'static>(&mut self, f: F) -> JobId {
+fn start<F: FnOnce() -> Output + Send + 'static>(&mut self, f: F, desc: String) -> JobId {
     let (tx, rx) = flume::unbounded();
     let id = self.next_job.to_string();
     self.next_job += 1;
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        thread::spawn(move || {
+    match std::thread::Builder::new()
+        .name(format!("rust-g job {} ({})", id, desc))
+        .spawn(move || {
             let _ = tx.send(f());
         })
-    }));
-
-    match result {
+    {
         Ok(handle) => {
             self.map.insert(id.clone(), Job { rx, handle });
         }
-        Err(_) => {
-            eprintln!("rust-g: thread spawn failed (likely EAGAIN)");
+        Err(e) => {
+            eprintln!(
+                "rust-g: thread spawn failed for job {} ({}) | OS error: {} (code: {:?}) | active jobs in map: {}",
+                id, desc, e, e.raw_os_error(), self.map.len()
+            );
         }
     }
 
@@ -67,8 +69,8 @@ thread_local! {
     static JOBS: RefCell<Jobs> = RefCell::default();
 }
 
-pub fn start<F: FnOnce() -> Output + Send + 'static>(f: F) -> JobId {
-    JOBS.with(|jobs| jobs.borrow_mut().start(f))
+pub fn start<F: FnOnce() -> Output + Send + 'static>(f: F, desc: impl Into<String>) -> JobId {
+    JOBS.with(|jobs| jobs.borrow_mut().start(f, desc.into()))
 }
 
 pub fn check(id: &str) -> String {
