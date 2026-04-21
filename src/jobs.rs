@@ -41,7 +41,8 @@ fn start<F: FnOnce() -> Output + Send + 'static>(&mut self, f: F, desc: String) 
         }
         Err(e) => {
             eprintln!(
-                "rust-g: thread spawn failed for job {} ({})\nOS error: {} (code: {:?})\nactive jobs in map: {}",
+                "[{}] rust-g: thread spawn failed for job {} ({})\nOS error: {} (code: {:?})\nactive jobs in map: {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                 id, desc, e, e.raw_os_error().unwrap_or(-1), self.map.len()
             );
         }
