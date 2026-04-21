@@ -41,8 +41,8 @@ fn start<F: FnOnce() -> Output + Send + 'static>(&mut self, f: F, desc: String) 
         }
         Err(e) => {
             eprintln!(
-                "rust-g: thread spawn failed for job {} ({}) | OS error: {} (code: {:?}) | active jobs in map: {}",
-                id, desc, e, e.raw_os_error(), self.map.len()
+                "rust-g: thread spawn failed for job {} ({})\nOS error: {} (code: {:?})\nactive jobs in map: {}",
+                id, desc, e, e.raw_os_error().unwrap_or(-1), self.map.len()
             );
         }
     }
