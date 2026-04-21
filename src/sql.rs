@@ -54,7 +54,7 @@ byond_fn!(fn sql_query_async(handle, query, params) {
     let handle = handle.to_owned();
     let query = query.to_owned();
     let params = params.to_owned();
-    let query_desc = format!("sql_query_async: {} → {}", query, params);
+    let query_desc = format!("sql_query_async: {} {}", query, params);
     Some(jobs::start(move || {
         match do_query(&handle, &query, &params) {
             Ok(o) => o.to_string(),
