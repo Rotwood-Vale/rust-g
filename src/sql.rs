@@ -117,7 +117,7 @@ byond_fn!(fn sql_check_query(id) {
         Err(e) => return Some(err_to_json(e)),
     };
     match QUERIES.get(&id) {
-        None => Some(json!({"status": "err", "data": "no such query"}).to_string()),
+        None => Some("NO SUCH JOB".to_string()),
         Some(entry) => {
             if entry.is_finished() {
             drop(entry);
@@ -131,7 +131,7 @@ byond_fn!(fn sql_check_query(id) {
                 Some(json!({"status": "err", "data": "query disappeared"}).to_string())
             }
         } else {
-                Some(json!({"status": "running"}).to_string())
+                Some("NO RESULTS YET".to_string())
             }
         }
     }
