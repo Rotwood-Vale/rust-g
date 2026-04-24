@@ -9,22 +9,13 @@ use serde::Deserialize;
 use serde_json::{Number, json, map::Map};
 use std::error::Error;
 use std::{collections::HashMap, sync::atomic::AtomicUsize};
-use tokio::runtime::Handle;
 
-static RUNTIME: Lazy<Handle> = Lazy::new(|| {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("failed to build tokio runtime");
-
-    let handle = runtime.handle().clone();
-
-    std::thread::spawn(move || {
-        runtime.block_on(std::future::pending::<()>());
-    });
-
-    handle
+        .expect("failed to build tokio runtime")
 });
 
 static QUERIES: Lazy<DashMap<usize, tokio::task::JoinHandle<String>>> = Lazy::new(DashMap::new);
@@ -33,7 +24,7 @@ static NEXT_QUERY_ID: AtomicUsize = AtomicUsize::new(0);
 // Interface
 
 const DEFAULT_PORT: u16 = 3306;
-// The `mysql` crate defaults to 10 and 100 for these, but that is too large.
+// The crate defaults to 10 and 100 for these, byond doesn't need that many.
 const DEFAULT_MIN_CONNECTIONS: usize = 1;
 const DEFAULT_MAX_CONNECTIONS: usize = 10;
 
@@ -122,11 +113,17 @@ byond_fn!(fn sql_check_query(id) {
         None => Some(json!({"status": "err", "data": "no such query"}).to_string()),
         Some(entry) => {
             if entry.is_finished() {
-                drop(entry);
-                let (_, join_handle) = QUERIES.remove(&id).unwrap();
-                Some(RUNTIME.block_on(join_handle)
-                    .unwrap_or_else(|e| err_to_json(e.to_string())))
+            drop(entry);
+            if let Some((_, join_handle)) = QUERIES.remove(&id) {
+                Some(
+                    RUNTIME
+                        .block_on(join_handle)
+                        .unwrap_or_else(|e| err_to_json(e.to_string())),
+                )
             } else {
+                Some(json!({"status": "err", "data": "query disappeared"}).to_string())
+            }
+        } else {
                 Some(json!({"status": "running"}).to_string())
             }
         }
@@ -175,14 +172,15 @@ async fn do_query(
     query: &str,
     params: &str,
 ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+    let handle: usize = handle.parse()?;
+
     let mut conn = {
-        let pool = match POOL.get(&handle.parse()?) {
+        let pool = match POOL.get(&handle) {
             Some(s) => s,
             None => return Ok(json!({"status": "offline"})),
         };
         pool.get_conn().await?
     };
-
     let mut query_result = conn.exec_iter(query, params_from_json(params)).await?;
 
     let mut columns = Vec::new();
@@ -196,9 +194,8 @@ async fn do_query(
     let last_insert_id = query_result.last_insert_id();
 
     let raw_rows: Vec<mysql_async::Row> = query_result.collect().await?;
-    drop(query_result);
 
-    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut rows = Vec::with_capacity(raw_rows.len());
     for row in raw_rows {
         let mut json_row: Vec<serde_json::Value> = Vec::new();
         for (i, col) in row.columns_ref().iter().enumerate() {
