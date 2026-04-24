@@ -7,8 +7,9 @@ use mysql_async::{
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{Number, json, map::Map};
-use std::error::Error;
+use std::{error::Error, sync::atomic::AtomicU32};
 use std::{collections::HashMap, sync::atomic::AtomicUsize};
+
 
 static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -28,6 +29,8 @@ const DEFAULT_PORT: u16 = 3306;
 const DEFAULT_MIN_CONNECTIONS: usize = 1;
 const DEFAULT_MAX_CONNECTIONS: usize = 10;
 
+static DEFAULT_TIMEOUT: AtomicU32 = AtomicU32::new(10);
+
 #[derive(Deserialize)]
 struct ConnectOptions {
     host: Option<String>,
@@ -35,6 +38,10 @@ struct ConnectOptions {
     user: Option<String>,
     pass: Option<String>,
     db_name: Option<String>,
+    read_timeout: Option<f32>,
+    // Temporary, to keep api compatibility and shit
+    #[allow(dead_code)]
+    write_timeout: Option<f32>,
     min_connections: Option<usize>,
     max_connections: Option<usize>,
 }
@@ -159,6 +166,13 @@ fn sql_connect(options: ConnectOptions) -> Result<serde_json::Value, Box<dyn Err
 
     let pool = Pool::new(builder);
 
+    // This is dogshit but I'm trying to do this without changing the API for now.
+    // Byond side has "blocking query timeout" and "async query timeout",
+    // it takes the max of the two values and passes it for both read and write timeout
+    if let Some(t) = options.read_timeout {
+        DEFAULT_TIMEOUT.store(t.ceil() as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let handle = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     POOL.insert(handle, pool);
     Ok(json!({
@@ -173,27 +187,53 @@ async fn do_query(
     params: &str,
 ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
     let handle: usize = handle.parse()?;
+    let timeout = DEFAULT_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
 
-    let mut conn = {
-        let pool = match POOL.get(&handle) {
-            Some(s) => s,
-            None => return Ok(json!({"status": "offline"})),
-        };
-        pool.get_conn().await?
+    let pool = match POOL.get(&handle) {
+        Some(s) => s,
+        None => return Ok(json!({"status": "offline"})),
     };
-    let mut query_result = conn.exec_iter(query, params_from_json(params)).await?;
 
-    let mut columns = Vec::new();
-    for col in query_result.columns_ref() {
-        columns.push(json!({
-            "name": col.name_str(),
-        }));
-    }
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout.into()),
+        async {
+            let mut conn = pool.get_conn().await?;
 
-    let affected = query_result.affected_rows();
-    let last_insert_id = query_result.last_insert_id();
+            let mut query_result =
+                conn.exec_iter(query, params_from_json(params)).await?;
 
-    let raw_rows: Vec<mysql_async::Row> = query_result.collect().await?;
+            let mut columns = Vec::new();
+            for col in query_result.columns_ref() {
+                columns.push(json!({
+                    "name": col.name_str(),
+                }));
+            }
+
+            let affected = query_result.affected_rows();
+            let last_insert_id = query_result.last_insert_id();
+
+            let raw_rows: Vec<mysql_async::Row> = query_result.collect().await?;
+
+            Ok::<_, Box<dyn Error + Send + Sync>>((
+                columns,
+                affected,
+                last_insert_id,
+                raw_rows,
+            ))
+        },
+    )
+    .await;
+
+    let (columns, affected, last_insert_id, raw_rows) = match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Ok(json!({
+                "status": "err",
+                "data": "query timed out"
+            }));
+        }
+    };
 
     let mut rows = Vec::with_capacity(raw_rows.len());
     for row in raw_rows {
@@ -203,6 +243,7 @@ async fn do_query(
             let value = row
                 .as_ref(i)
                 .ok_or("length of row was smaller than column count")?;
+
             let converted = match value {
                 mysql_async::Value::Bytes(b) => match ctype {
                     MYSQL_TYPE_VARCHAR | MYSQL_TYPE_STRING | MYSQL_TYPE_VAR_STRING => {
@@ -239,12 +280,11 @@ async fn do_query(
                 }
                 _ => serde_json::Value::Null,
             };
+
             json_row.push(converted);
         }
         rows.push(serde_json::Value::Array(json_row));
     }
-
-    drop(conn);
 
     Ok(json!({
         "status": "ok",
